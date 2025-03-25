@@ -6,6 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.RateLimiter
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -36,6 +37,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private var rateLimiter : RateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
+    private val ongoingWindow = OngoingWindow(parallelRequests)
+
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -44,9 +47,7 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
-        while (!rateLimiter.tick()) {
-            Thread.sleep(1000)
-        }
+        ongoingWindow.acquire()
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
@@ -93,6 +94,9 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        }
+        finally {
+            ongoingWindow.release()
         }
     }
 
