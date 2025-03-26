@@ -34,7 +34,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private var rateLimiter : RateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private var rateLimiter : SlidingWindowRateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     private val client = OkHttpClient.Builder().build()
 
@@ -44,9 +44,7 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
-        while (!rateLimiter.tick()) {
-            Thread.sleep(1000)
-        }
+        rateLimiter.tickBlocking()
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
