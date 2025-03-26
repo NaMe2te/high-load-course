@@ -6,6 +6,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.NonBlockingOngoingWindow
+import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.RateLimiter
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -34,19 +36,15 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private var rateLimiter : RateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-
     private val client = OkHttpClient.Builder().build()
+    private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
         logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
-
-        while (!rateLimiter.tick()) {
-            Thread.sleep(1000)
-        }
 
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
@@ -60,6 +58,29 @@ class PaymentExternalSystemAdapterImpl(
         }.build()
 
         try {
+
+            while(ongoingWindow.putIntoWindow() is NonBlockingOngoingWindow.WindowResponse.Fail) {
+                if (now() + requestAverageProcessingTime.toMillis() > deadline) {
+                    logger.error("[$accountName] Payment timeout for payment: $paymentId")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, "Request timeout.")
+                    }
+
+                    return
+                }
+            }
+
+            while(!rateLimiter.tick()) {
+                if (now() + requestAverageProcessingTime.toMillis() > deadline) {
+                    logger.error("[$accountName] Payment timeout for payment: $paymentId")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, "Request timeout.")
+                    }
+
+                    return
+                }
+            }
+
             client.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -93,6 +114,8 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
+        } finally {
+            ongoingWindow.releaseWindow()
         }
     }
 
