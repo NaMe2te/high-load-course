@@ -37,7 +37,7 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder().build()
-    private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
+    private val ongoingWindow = OngoingWindow(parallelRequests)
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -59,27 +59,8 @@ class PaymentExternalSystemAdapterImpl(
 
         try {
 
-            while(ongoingWindow.putIntoWindow() is NonBlockingOngoingWindow.WindowResponse.Fail) {
-                if (now() + requestAverageProcessingTime.toMillis() > deadline) {
-                    logger.error("[$accountName] Payment timeout for payment: $paymentId")
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, "Request timeout.")
-                    }
-
-                    return
-                }
-            }
-
-            while(!rateLimiter.tick()) {
-                if (now() + requestAverageProcessingTime.toMillis() > deadline) {
-                    logger.error("[$accountName] Payment timeout for payment: $paymentId")
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, "Request timeout.")
-                    }
-
-                    return
-                }
-            }
+            ongoingWindow.acquire()
+            rateLimiter.tickBlocking()
 
             client.newCall(request).execute().use { response ->
                 val body = try {
@@ -115,7 +96,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } finally {
-            ongoingWindow.releaseWindow()
+            ongoingWindow.release()
         }
     }
 
