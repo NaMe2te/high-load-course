@@ -37,7 +37,7 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder().build()
-    private val ongoingWindow = OngoingWindow(parallelRequests)
+    private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -57,10 +57,53 @@ class PaymentExternalSystemAdapterImpl(
             post(emptyBody)
         }.build()
 
-        try {
+        while (ongoingWindow.putIntoWindow() is NonBlockingOngoingWindow.WindowResponse.Fail) {
+            if (now() + requestAverageProcessingTime.toMillis() > deadline) {
+                logger.error("[$accountName] Payment timeout for payment: $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, "Request timeout.")
+                }
 
-            ongoingWindow.acquire()
-            rateLimiter.tickBlocking()
+                return
+            }
+
+            Thread.sleep(10);
+        }
+
+        var retryAfterTime = 2;
+        while (true) {
+            if (now() + requestAverageProcessingTime.toMillis() < deadline) {
+                rateLimiter.tickBlocking()
+                val sendResult = sendRequest(request, paymentId, transactionId)
+                if (sendResult == SendRequestResult.TemporaryError) {
+                    retryAfterTime *= 2;
+                    Thread.sleep(retryAfterTime.toLong())
+                } else {
+                    break
+                }
+            }
+            else {
+                logger.error("[$accountName] Payment timeout for payment: $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, "Request timeout.")
+                }
+
+                break
+            }
+        }
+
+        ongoingWindow.releaseWindow()
+    }
+
+    override fun price() = properties.price
+
+    override fun isEnabled() = properties.enabled
+
+    override fun name() = properties.accountName
+
+
+    private fun sendRequest(request: Request, paymentId: UUID, transactionId: UUID): SendRequestResult {
+        try {
 
             client.newCall(request).execute().use { response ->
                 val body = try {
@@ -77,6 +120,16 @@ class PaymentExternalSystemAdapterImpl(
                 paymentESService.update(paymentId) {
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
+
+                if (!body.result) {
+                    return if (body.message == "Temporary error") {
+                        SendRequestResult.TemporaryError
+                    } else {
+                        SendRequestResult.Error
+                    }
+                }
+
+                return SendRequestResult.Success
             }
         } catch (e: Exception) {
             when (e) {
@@ -95,17 +148,16 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
             }
-        } finally {
-            ongoingWindow.release()
+
+            return SendRequestResult.Error
         }
     }
+}
 
-    override fun price() = properties.price
-
-    override fun isEnabled() = properties.enabled
-
-    override fun name() = properties.accountName
-
+enum class SendRequestResult {
+    Error,
+    TemporaryError,
+    Success
 }
 
 public fun now() = System.currentTimeMillis()
