@@ -12,9 +12,11 @@ import ru.quipy.common.utils.RateLimiter
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.InterruptedIOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import kotlin.time.measureTime
 
 
 // Advice: always treat time as a Duration
@@ -38,7 +40,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient
         .Builder()
-        .callTimeout(requestAverageProcessingTime)
+        .callTimeout(Duration.ofMillis((requestAverageProcessingTime.toMillis() * 1.2).toLong()))
         .build()
 
     private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
@@ -74,14 +76,14 @@ class PaymentExternalSystemAdapterImpl(
             Thread.sleep(10);
         }
 
-        var retryAfterTime = 2;
+        var retryAfterTime: Long = 2;
         while (true) {
             if (now() + requestAverageProcessingTime.toMillis() < deadline) {
                 rateLimiter.tickBlocking()
-                val sendResult = sendRequest(request, paymentId, transactionId)
+                val sendResult: SendRequestResult = sendRequest(request, paymentId, transactionId)
                 if (sendResult == SendRequestResult.TemporaryError) {
                     retryAfterTime *= 2;
-                    Thread.sleep(retryAfterTime.toLong())
+                    Thread.sleep(retryAfterTime * 10)
                 } else {
                     break
                 }
@@ -125,15 +127,16 @@ class PaymentExternalSystemAdapterImpl(
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
 
-                if (!body.result) {
-                    return if (body.message == "Temporary error") {
-                        SendRequestResult.TemporaryError
-                    } else {
-                        SendRequestResult.Error
+                return when {
+                    response.isSuccessful && body.result -> SendRequestResult.Success
+                    else -> {
+                        if (response.code == 429) {
+                            SendRequestResult.TemporaryError
+                        } else {
+                            SendRequestResult.Error
+                        }
                     }
                 }
-
-                return SendRequestResult.Success
             }
         } catch (e: Exception) {
             when (e) {
@@ -142,6 +145,15 @@ class PaymentExternalSystemAdapterImpl(
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                     }
+                }
+
+                is InterruptedIOException -> {
+                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                    }
+
+                    return SendRequestResult.TemporaryError
                 }
 
                 else -> {
