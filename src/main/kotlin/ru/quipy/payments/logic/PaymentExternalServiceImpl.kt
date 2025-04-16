@@ -38,10 +38,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient
-        .Builder()
-        .callTimeout(Duration.ofMillis((requestAverageProcessingTime.toMillis() * 1.2).toLong()))
-        .build()
+    private val client = OkHttpClient.Builder().build()
 
     private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
@@ -130,7 +127,7 @@ class PaymentExternalSystemAdapterImpl(
                 return when {
                     response.isSuccessful && body.result -> SendRequestResult.Success
                     else -> {
-                        if (response.code == 429) {
+                        if (response.code == 429 || response.code == 500 || response.code == 504 || response.code == 502) {
                             SendRequestResult.TemporaryError
                         } else {
                             SendRequestResult.Error
